@@ -1,182 +1,205 @@
-"""Chunsik BongoCat v1.0 - Windows desktop overlay."""
-import sys
-import math
+"""Chunsik BongoCat v2 - independent paws and per-key tracking on Windows."""
+import sys, time, math
 from pathlib import Path
-from PySide6.QtCore import Qt, QTimer, QPoint, QRectF, Signal, QObject
-from PySide6.QtGui import QPixmap, QPainter, QIcon, QAction, QColor, QPen
+from PySide6.QtCore import Qt, QTimer, QObject, Signal, QRectF, QPoint
+from PySide6.QtGui import QPainter, QPixmap, QAction, QIcon, QColor, QPen
 from PySide6.QtWidgets import QApplication, QWidget, QMenu, QSystemTrayIcon
 from pynput import keyboard, mouse
 
-ROOT = Path(__file__).resolve().parent
-IMAGE = ROOT / 'assets' / 'chunsik.png'
+ROOT = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
+ASSETS = ROOT / 'assets'
+W, H = 1672, 941
+# Source image pixel coordinates. The right paw switches between mouse and keyboard.
+HOME = {'left': (488., 650.), 'right': (1099., 678.)}
+# Keyboard illustration covers approximately x=210..930, y=690..835.
+ROWS = [('1234567890-=', 247, 714, 57), ('qwertyuiop[]\\', 273, 748, 53),
+        ('asdfghjkl;\'', 294, 782, 55), ('zxcvbnm,./', 343, 810, 56)]
+KEYS = {}
+for chars, start, y, step in ROWS:
+    for i, ch in enumerate(chars):
+        KEYS[ch] = (start + i * step, y)
+KEYS.update({' ': (575, 823), 'space': (575, 823), 'enter': (869, 786),
+             'backspace': (880, 715), 'tab': (240, 748), 'shift': (315, 810),
+             'shift_l': (315, 810), 'shift_r': (850, 810), 'ctrl_l': (246, 824),
+             'ctrl_r': (840, 824), 'alt_l': (425, 824), 'alt_r': (760, 824),
+             'esc': (238, 705), 'up': (808, 804), 'down': (808, 828),
+             'left': (770, 828), 'right': (846, 828)})
 
-class Events(QObject):
-    typing = Signal()
-    clicking = Signal()
-    moving = Signal()
+class Signals(QObject):
+    key = Signal(str)
+    mouse_move = Signal(float, float)
+    mouse_click = Signal(str, bool)
 
 class Overlay(QWidget):
     def __init__(self, app):
         super().__init__()
         self.app = app
-        self.events = Events()
-        self.events.typing.connect(self.on_type)
-        self.events.clicking.connect(self.on_click)
-        self.events.moving.connect(self.on_move)
-        self.image = QPixmap(str(IMAGE))
-        if self.image.isNull():
-            raise RuntimeError('assets/chunsik.png 이미지가 없습니다.')
-        self.scale_width = 400
-        self.always_on_top = True
+        self.base = QPixmap(str(ASSETS/'base.png'))
+        self.paws = {s: QPixmap(str(ASSETS/f'paw_{s}.png')) for s in HOME}
+        self.original = QPixmap(str(ASSETS/'original.png'))
+        if any(p.isNull() for p in [self.base, self.original, *self.paws.values()]):
+            raise RuntimeError('캐릭터 이미지 파일이 없습니다.')
+        self.signals = Signals()
+        self.signals.key.connect(self.on_key)
+        self.signals.mouse_move.connect(self.on_mouse_move)
+        self.signals.mouse_click.connect(self.on_mouse_click)
+        self.targets = dict(HOME)
+        self.positions = dict(HOME)
+        self.key_deadlines = {'left': 0., 'right': 0.}
+        self.last_key_side = 'right'
+        self.mouse_xy = (0., 0.)
+        self.mouse_active_until = 0.
+        self.click_until = 0.
         self.frame = 0
-        self.key_ttl = 0
-        self.click_ttl = 0
-        self.move_ttl = 0
-        self.drag_start = None
-        self.setWindowTitle('춘식이 봉고캣')
+        self.always_on_top = True
+        self.drag_offset = None
+        self.width_setting = 420
+        self.setWindowTitle('춘식이 봉고캣 v2')
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setWindowFlags(self.flags())
-        self.resize(self.scale_width, round(self.scale_width * self.image.height() / self.image.width()))
+        self.setWindowFlags(self.window_flags())
+        self.setFixedSize(self.width_setting, round(self.width_setting*H/W))
         screen = QApplication.primaryScreen().availableGeometry()
-        self.move(screen.right() - self.width() - 28, screen.bottom() - self.height() - 28)
+        self.move(screen.right()-self.width()-25, screen.bottom()-self.height()-30)
         self.make_tray()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
-        self.timer.start(33)
-        self.kb_listener = keyboard.Listener(on_press=lambda key: self.events.typing.emit())
-        self.ms_listener = mouse.Listener(on_click=lambda *args: self.events.clicking.emit() if args[3] else None,
-                                          on_move=lambda *args: self.events.moving.emit())
-        self.kb_listener.start()
-        self.ms_listener.start()
+        self.timer.start(16)
+        self.kb = keyboard.Listener(on_press=self.keyboard_callback)
+        self.ms = mouse.Listener(on_move=lambda x,y:self.signals.mouse_move.emit(float(x),float(y)),
+                                 on_click=lambda x,y,button,pressed:self.signals.mouse_click.emit(str(button),pressed))
+        self.kb.start()
+        self.ms.start()
         self.show()
 
-    def flags(self):
-        flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
-        if self.always_on_top:
-            flags |= Qt.WindowType.WindowStaysOnTopHint
-        return flags
+    def window_flags(self):
+        f = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
+        return f | (Qt.WindowType.WindowStaysOnTopHint if self.always_on_top else Qt.WindowType(0))
+
+    def keyboard_callback(self, key):
+        try:
+            name = key.char.lower() if key.char else ''
+        except AttributeError:
+            name = ''
+        if not name:
+            name = str(key).replace('Key.', '').lower()
+        self.signals.key.emit(name)
+
+    def on_key(self, name):
+        if name not in KEYS:
+            name = 'space' if name in ('space', 'spacebar') else 'enter'
+        x, y = KEYS[name]
+        # Keyboard split follows the key position, not random alternating paws.
+        side = 'left' if x < 585 else 'right'
+        now = time.monotonic()
+        self.targets[side] = (x, y-54)
+        self.key_deadlines[side] = now + .18
+        self.last_key_side = side
+
+    def on_mouse_move(self, x, y):
+        self.mouse_xy = (x, y)
+        self.mouse_active_until = time.monotonic() + .35
+
+    def on_mouse_click(self, button, pressed):
+        if pressed:
+            self.click_until = time.monotonic() + .15
+            self.mouse_active_until = time.monotonic() + .55
+
+    def tick(self):
+        now = time.monotonic()
+        self.frame += 1
+        if now < self.mouse_active_until and now >= self.key_deadlines['right']:
+            geo = QApplication.primaryScreen().geometry()
+            mx, my = self.mouse_xy
+            nx = max(0., min(1., (mx-geo.left())/max(1,geo.width())))
+            ny = max(0., min(1., (my-geo.top())/max(1,geo.height())))
+            self.targets['right'] = (1070 + nx*115, 675 + ny*65 + (12 if now < self.click_until else 0))
+        for side in HOME:
+            if now > self.key_deadlines[side] and (side == 'left' or now > self.mouse_active_until):
+                self.targets[side] = HOME[side]
+            x,y = self.positions[side]
+            tx,ty = self.targets[side]
+            self.positions[side] = (x+(tx-x)*.31, y+(ty-y)*.31)
+        if self.isVisible(): self.update()
+
+    def paintEvent(self, event):
+        p=QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        p.scale(self.width()/W, self.height()/H)
+        p.drawPixmap(0,0,self.base)
+        # keyboard hit highlight at the exact illustrated key coordinate
+        now=time.monotonic()
+        for side in HOME:
+            if now < self.key_deadlines[side]:
+                tx,ty=self.targets[side]
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(255,178,204,85))
+                p.drawEllipse(QRectF(tx-23,ty+37,46,24))
+        for side in ('left','right'):
+            x,y=self.positions[side]
+            paw=self.paws[side]
+            p.drawPixmap(QRectF(x-paw.width()/2,y-paw.height()/2,paw.width(),paw.height()),paw,QRectF(paw.rect()))
+        p.end()
 
     def make_tray(self):
-        self.tray = QSystemTrayIcon(QIcon(self.image), self)
-        self.menu = QMenu()
-        self.visible_action = QAction('춘식이 숨기기', self)
-        self.visible_action.triggered.connect(self.toggle_visible)
-        self.menu.addAction(self.visible_action)
-        self.top_action = QAction('항상 위에 표시', self)
-        self.top_action.setCheckable(True)
+        self.tray=QSystemTrayIcon(QIcon(self.original),self)
+        self.menu=QMenu()
+        self.show_action=QAction('춘식이 숨기기',self)
+        self.show_action.triggered.connect(self.toggle_visible)
+        self.menu.addAction(self.show_action)
+        self.top_action=QAction('항상 위에 표시',self,checkable=True)
         self.top_action.setChecked(True)
         self.top_action.triggered.connect(self.toggle_top)
         self.menu.addAction(self.top_action)
         self.menu.addSeparator()
-        for label, width in [('작게 (280px)', 280), ('보통 (400px)', 400), ('크게 (560px)', 560)]:
-            action = QAction(label, self)
-            action.triggered.connect(lambda checked=False, w=width: self.change_size(w))
-            self.menu.addAction(action)
+        for label,w in [('작게 (300px)',300),('보통 (420px)',420),('크게 (600px)',600)]:
+            a=QAction(label,self)
+            a.triggered.connect(lambda checked=False,width=w:self.change_size(width))
+            self.menu.addAction(a)
         self.menu.addSeparator()
-        quit_action = QAction('프로그램 종료', self)
-        quit_action.triggered.connect(self.quit_app)
-        self.menu.addAction(quit_action)
+        exit_action=QAction('종료',self)
+        exit_action.triggered.connect(self.quit_app)
+        self.menu.addAction(exit_action)
         self.tray.setContextMenu(self.menu)
-        self.tray.activated.connect(self.tray_clicked)
-        self.tray.setToolTip('춘식이 봉고캣: 우클릭하여 설정')
+        self.tray.activated.connect(lambda reason:self.toggle_visible() if reason==QSystemTrayIcon.ActivationReason.Trigger else None)
+        self.tray.setToolTip('춘식이 봉고캣 v2')
         self.tray.show()
-
-    def tray_clicked(self, reason):
-        if reason == QSystemTrayIcon.ActivationReason.Trigger:
-            self.toggle_visible()
 
     def toggle_visible(self):
         if self.isVisible():
-            self.hide()
-            self.visible_action.setText('춘식이 보이기')
+            self.hide();self.show_action.setText('춘식이 보이기')
         else:
-            self.show()
-            self.visible_action.setText('춘식이 숨기기')
+            self.show();self.show_action.setText('춘식이 숨기기')
 
     def toggle_top(self, checked):
-        was_visible = self.isVisible()
-        self.always_on_top = checked
-        self.setWindowFlags(self.flags())
-        if was_visible:
-            self.show()
+        visible=self.isVisible()
+        self.always_on_top=checked
+        self.setWindowFlags(self.window_flags())
+        if visible:self.show()
 
-    def change_size(self, width):
-        self.scale_width = width
-        self.resize(width, round(width * self.image.height() / self.image.width()))
-        self.update()
+    def change_size(self,width):
+        self.width_setting=width
+        self.setFixedSize(width,round(width*H/W))
 
-    def on_type(self):
-        self.key_ttl = 9
+    def mousePressEvent(self,event):
+        if event.button()==Qt.MouseButton.LeftButton:
+            self.drag_offset=event.globalPosition().toPoint()-self.frameGeometry().topLeft()
 
-    def on_click(self):
-        self.click_ttl = 11
+    def mouseMoveEvent(self,event):
+        if self.drag_offset is not None:
+            self.move(event.globalPosition().toPoint()-self.drag_offset)
 
-    def on_move(self):
-        self.move_ttl = 6
+    def mouseReleaseEvent(self,event):
+        self.drag_offset=None
 
-    def tick(self):
-        self.frame += 1
-        self.key_ttl = max(0, self.key_ttl - 1)
-        self.click_ttl = max(0, self.click_ttl - 1)
-        self.move_ttl = max(0, self.move_ttl - 1)
-        if self.isVisible():
-            self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        sx = self.width() / self.image.width()
-        sy = self.height() / self.image.height()
-        # The first prototype uses a subtle bounce and input highlights.
-        bob = math.sin(self.frame * .075) * 1.2
-        if self.key_ttl:
-            bob -= 3.5 if self.frame % 4 < 2 else 0
-        if self.click_ttl:
-            bob -= 2
-        painter.drawPixmap(QRectF(0, bob + 3, self.width(), self.height() - 4), self.image, QRectF(self.image.rect()))
-        painter.setPen(Qt.PenStyle.NoPen)
-        if self.key_ttl:
-            opacity = min(0.7, self.key_ttl / 12)
-            painter.setBrush(QColor(255, 230, 110, int(135 * opacity)))
-            for x, y in [(380, 750), (560, 785), (800, 790)]:
-                painter.drawEllipse(QRectF(x*sx-9, y*sy-7, 18, 14))
-        if self.click_ttl:
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.setPen(QPen(QColor(255, 116, 166, int(220*self.click_ttl/11)), 3))
-            cx, cy = 1195*sx, 780*sy
-            r = (15 + (11-self.click_ttl)*2) * sx
-            painter.drawEllipse(QPoint(round(cx), round(cy)), round(r), round(r*.6))
-        if self.move_ttl:
-            painter.setBrush(QColor(255, 180, 205, int(100*self.move_ttl/6)))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawEllipse(QRectF(1150*sx, 720*sy, 35*sx, 18*sy))
-        painter.end()
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.drag_start = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            event.accept()
-
-    def mouseMoveEvent(self, event):
-        if self.drag_start is not None:
-            self.move(event.globalPosition().toPoint() - self.drag_start)
-            event.accept()
-
-    def mouseReleaseEvent(self, event):
-        self.drag_start = None
-
-    def contextMenuEvent(self, event):
+    def contextMenuEvent(self,event):
         self.menu.exec(event.globalPos())
 
     def quit_app(self):
-        self.kb_listener.stop()
-        self.ms_listener.stop()
-        self.tray.hide()
-        self.app.quit()
+        self.kb.stop();self.ms.stop();self.tray.hide();self.app.quit()
 
-if __name__ == '__main__':
-    app = QApplication(sys.argv)
+if __name__=='__main__':
+    app=QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
-    window = Overlay(app)
+    window=Overlay(app)
     sys.exit(app.exec())
