@@ -1,4 +1,4 @@
-"""Chunsik BongoCat v2 - independent paws and per-key tracking on Windows."""
+"""Chunsik BongoCat v3 - rapid tap animation and per-key tracking on Windows."""
 import sys, time, math
 from pathlib import Path
 from PySide6.QtCore import Qt, QTimer, QObject, Signal, QRectF, QPoint
@@ -26,7 +26,7 @@ KEYS.update({' ': (575, 823), 'space': (575, 823), 'enter': (869, 786),
              'left': (770, 828), 'right': (846, 828)})
 
 class Signals(QObject):
-    key = Signal(str)
+    key = Signal(str, bool)
     mouse_move = Signal(float, float)
     mouse_click = Signal(str, bool)
 
@@ -47,6 +47,12 @@ class Overlay(QWidget):
         self.positions = dict(HOME)
         self.key_deadlines = {'left': 0., 'right': 0.}
         self.last_key_side = 'right'
+        self.anim = {side: None for side in HOME}
+        self.last_press = {}
+        self.pressed_keys = set()
+        self.tap_duration = .115
+        self.tap_lift = 31
+        self.last_tick = time.monotonic()
         self.mouse_xy = (0., 0.)
         self.mouse_active_until = 0.
         self.click_until = 0.
@@ -54,7 +60,7 @@ class Overlay(QWidget):
         self.always_on_top = True
         self.drag_offset = None
         self.width_setting = 420
-        self.setWindowTitle('춘식이 봉고캣 v2')
+        self.setWindowTitle('신춘식 봉고캣 v3')
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowFlags(self.window_flags())
         self.setFixedSize(self.width_setting, round(self.width_setting*H/W))
@@ -64,7 +70,8 @@ class Overlay(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(16)
-        self.kb = keyboard.Listener(on_press=self.keyboard_callback)
+        self.kb = keyboard.Listener(on_press=lambda key:self.keyboard_callback(key, True),
+                                    on_release=lambda key:self.keyboard_callback(key, False))
         self.ms = mouse.Listener(on_move=lambda x,y:self.signals.mouse_move.emit(float(x),float(y)),
                                  on_click=lambda x,y,button,pressed:self.signals.mouse_click.emit(str(button),pressed))
         self.kb.start()
@@ -75,24 +82,32 @@ class Overlay(QWidget):
         f = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
         return f | (Qt.WindowType.WindowStaysOnTopHint if self.always_on_top else Qt.WindowType(0))
 
-    def keyboard_callback(self, key):
+    def keyboard_callback(self, key, pressed):
         try:
             name = key.char.lower() if key.char else ''
         except AttributeError:
             name = ''
         if not name:
             name = str(key).replace('Key.', '').lower()
-        self.signals.key.emit(name)
+        self.signals.key.emit(name, pressed)
 
-    def on_key(self, name):
+    def on_key(self, name, pressed):
         if name not in KEYS:
-            name = 'space' if name in ('space', 'spacebar') else 'enter'
-        x, y = KEYS[name]
-        # Keyboard split follows the key position, not random alternating paws.
-        side = 'left' if x < 585 else 'right'
+            return  # Unknown keys should not make the paws jump to Enter.
         now = time.monotonic()
-        self.targets[side] = (x, y-54)
-        self.key_deadlines[side] = now + .18
+        if not pressed:
+            self.pressed_keys.discard(name)
+            return
+        # Windows auto-repeat can fire dozens of duplicate presses while held.
+        if name in self.pressed_keys and now-self.last_press.get(name, 0) < .10:
+            return
+        self.pressed_keys.add(name)
+        self.last_press[name] = now
+        x, y = KEYS[name]
+        side = 'left' if x < 585 else 'right'
+        self.anim[side] = {'start':now, 'from':self.positions[side],
+                           'to':(float(x), float(y-48)), 'key':name}
+        self.key_deadlines[side] = now + self.tap_duration
         self.last_key_side = side
 
     def on_mouse_move(self, x, y):
@@ -104,22 +119,52 @@ class Overlay(QWidget):
             self.click_until = time.monotonic() + .15
             self.mouse_active_until = time.monotonic() + .55
 
+    @staticmethod
+    def smooth(t):
+        t=max(0., min(1.,t))
+        return t*t*(3-2*t)
+
     def tick(self):
         now = time.monotonic()
+        dt = min(.05, max(.001, now-self.last_tick))
+        self.last_tick = now
         self.frame += 1
-        if now < self.mouse_active_until and now >= self.key_deadlines['right']:
-            geo = QApplication.primaryScreen().geometry()
-            mx, my = self.mouse_xy
-            nx = max(0., min(1., (mx-geo.left())/max(1,geo.width())))
-            ny = max(0., min(1., (my-geo.top())/max(1,geo.height())))
-            self.targets['right'] = (1070 + nx*115, 675 + ny*65 + (12 if now < self.click_until else 0))
         for side in HOME:
-            if now > self.key_deadlines[side] and (side == 'left' or now > self.mouse_active_until):
-                self.targets[side] = HOME[side]
-            x,y = self.positions[side]
-            tx,ty = self.targets[side]
-            self.positions[side] = (x+(tx-x)*.31, y+(ty-y)*.31)
-        if self.isVisible(): self.update()
+            a = self.anim[side]
+            if a is not None:
+                t = (now-a['start'])/self.tap_duration
+                if t >= 1.:
+                    self.anim[side] = None
+                else:
+                    # Fast, distinct lift -> strike -> recoil. No long floaty glide.
+                    if t < .34:
+                        k=self.smooth(t/.34)
+                        x=a['from'][0]+(a['to'][0]-a['from'][0])*k
+                        y=a['from'][1]+(a['to'][1]-a['from'][1])*k-self.tap_lift*math.sin(math.pi*k/2)
+                    elif t < .61:
+                        k=self.smooth((t-.34)/.27)
+                        x=a['to'][0]
+                        y=a['to'][1]-self.tap_lift*(1-k)+9*math.sin(math.pi*k)
+                    else:
+                        k=self.smooth((t-.61)/.39)
+                        x=a['to'][0]+(HOME[side][0]-a['to'][0])*k
+                        y=a['to'][1]+(HOME[side][1]-a['to'][1])*k-12*math.sin(math.pi*k)
+                    self.positions[side]=(x,y)
+                    continue
+            if side=='right' and now < self.mouse_active_until:
+                geo=QApplication.primaryScreen().geometry()
+                mx,my=self.mouse_xy
+                nx=max(0.,min(1.,(mx-geo.left())/max(1,geo.width())))
+                ny=max(0.,min(1.,(my-geo.top())/max(1,geo.height())))
+                target=(1070+nx*115, 675+ny*65+(9 if now<self.click_until else 0))
+            else:
+                target=HOME[side]
+            # Frame-rate independent damping: responsive mouse, gentle return.
+            k=1-math.exp(-dt*(27 if side=='right' and now<self.mouse_active_until else 19))
+            x,y=self.positions[side]
+            self.positions[side]=(x+(target[0]-x)*k,y+(target[1]-y)*k)
+        if self.isVisible():
+            self.update()
 
     def paintEvent(self, event):
         p=QPainter(self)
@@ -130,8 +175,8 @@ class Overlay(QWidget):
         # keyboard hit highlight at the exact illustrated key coordinate
         now=time.monotonic()
         for side in HOME:
-            if now < self.key_deadlines[side]:
-                tx,ty=self.targets[side]
+            if self.anim[side] is not None and .34 < (now-self.anim[side]['start'])/self.tap_duration < .75:
+                tx,ty=self.anim[side]['to']
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(QColor(255,178,204,85))
                 p.drawEllipse(QRectF(tx-23,ty+37,46,24))
@@ -162,7 +207,7 @@ class Overlay(QWidget):
         self.menu.addAction(exit_action)
         self.tray.setContextMenu(self.menu)
         self.tray.activated.connect(lambda reason:self.toggle_visible() if reason==QSystemTrayIcon.ActivationReason.Trigger else None)
-        self.tray.setToolTip('춘식이 봉고캣 v2')
+        self.tray.setToolTip('신춘식 봉고캣 v3')
         self.tray.show()
 
     def toggle_visible(self):
