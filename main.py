@@ -1,4 +1,4 @@
-"""Chunsik BongoCat v3 - rapid tap animation and per-key tracking on Windows."""
+"""Chunsik BongoCat v3.1 - keyboard left paw, mouse right paw and moving mouse."""
 import sys, time, math
 from pathlib import Path
 from PySide6.QtCore import Qt, QTimer, QObject, Signal, QRectF, QPoint
@@ -37,6 +37,9 @@ class Overlay(QWidget):
         self.base = QPixmap(str(ASSETS/'base.png'))
         self.paws = {s: QPixmap(str(ASSETS/f'paw_{s}.png')) for s in HOME}
         self.original = QPixmap(str(ASSETS/'original.png'))
+        self.mouse_image = QPixmap(str(ASSETS/'mouse.png'))
+        if self.mouse_image.isNull():
+            raise RuntimeError('assets/mouse.png 파일이 없습니다.')
         if any(p.isNull() for p in [self.base, self.original, *self.paws.values()]):
             raise RuntimeError('캐릭터 이미지 파일이 없습니다.')
         self.signals = Signals()
@@ -54,13 +57,16 @@ class Overlay(QWidget):
         self.tap_lift = 31
         self.last_tick = time.monotonic()
         self.mouse_xy = (0., 0.)
+        self.mouse_last_xy = None
+        self.mouse_offset = [0., 0.]
+        self.mouse_last_motion = 0.
         self.mouse_active_until = 0.
         self.click_until = 0.
         self.frame = 0
         self.always_on_top = True
         self.drag_offset = None
         self.width_setting = 420
-        self.setWindowTitle('신춘식 봉고캣 v3')
+        self.setWindowTitle('신춘식 봉고캣 v3.1')
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowFlags(self.window_flags())
         self.setFixedSize(self.width_setting, round(self.width_setting*H/W))
@@ -104,14 +110,23 @@ class Overlay(QWidget):
         self.pressed_keys.add(name)
         self.last_press[name] = now
         x, y = KEYS[name]
-        side = 'left' if x < 585 else 'right'
+        side = 'left'  # Keyboard never controls the mouse paw.
+        # Compress the full keyboard into a comfortable left-paw reach.
+        x = 380 + (x-210)*0.40
         self.anim[side] = {'start':now, 'from':self.positions[side],
                            'to':(float(x), float(y-48)), 'key':name}
         self.key_deadlines[side] = now + self.tap_duration
         self.last_key_side = side
 
     def on_mouse_move(self, x, y):
+        if self.mouse_last_xy is not None:
+            dx = max(-90., min(90., x-self.mouse_last_xy[0]))
+            dy = max(-90., min(90., y-self.mouse_last_xy[1]))
+            self.mouse_offset[0] = max(-42., min(42., self.mouse_offset[0]+dx*.30))
+            self.mouse_offset[1] = max(-22., min(22., self.mouse_offset[1]+dy*.25))
+        self.mouse_last_xy = (x,y)
         self.mouse_xy = (x, y)
+        self.mouse_last_motion = time.monotonic()
         self.mouse_active_until = time.monotonic() + .35
 
     def on_mouse_click(self, button, pressed):
@@ -151,12 +166,13 @@ class Overlay(QWidget):
                         y=a['to'][1]+(HOME[side][1]-a['to'][1])*k-12*math.sin(math.pi*k)
                     self.positions[side]=(x,y)
                     continue
-            if side=='right' and now < self.mouse_active_until:
-                geo=QApplication.primaryScreen().geometry()
-                mx,my=self.mouse_xy
-                nx=max(0.,min(1.,(mx-geo.left())/max(1,geo.width())))
-                ny=max(0.,min(1.,(my-geo.top())/max(1,geo.height())))
-                target=(1070+nx*115, 675+ny*65+(9 if now<self.click_until else 0))
+            if side=='right':
+                if now > self.mouse_active_until:
+                    decay = math.exp(-dt*6.0)
+                    self.mouse_offset[0] *= decay
+                    self.mouse_offset[1] *= decay
+                target=(HOME['right'][0]+self.mouse_offset[0],
+                        HOME['right'][1]+self.mouse_offset[1]+(7 if now<self.click_until else 0))
             else:
                 target=HOME[side]
             # Frame-rate independent damping: responsive mouse, gentle return.
@@ -180,6 +196,10 @@ class Overlay(QWidget):
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(QColor(255,178,204,85))
                 p.drawEllipse(QRectF(tx-23,ty+37,46,24))
+        # Mouse graphic and right paw use the SAME offset. Pad stays fixed.
+        rx,ry=self.positions['right']
+        mdx,mdy=rx-HOME['right'][0],ry-HOME['right'][1]
+        p.drawPixmap(QRectF(1015+mdx,695+mdy,275,160),self.mouse_image,QRectF(self.mouse_image.rect()))
         for side in ('left','right'):
             x,y=self.positions[side]
             paw=self.paws[side]
@@ -207,7 +227,7 @@ class Overlay(QWidget):
         self.menu.addAction(exit_action)
         self.tray.setContextMenu(self.menu)
         self.tray.activated.connect(lambda reason:self.toggle_visible() if reason==QSystemTrayIcon.ActivationReason.Trigger else None)
-        self.tray.setToolTip('신춘식 봉고캣 v3')
+        self.tray.setToolTip('신춘식 봉고캣 v3.1')
         self.tray.show()
 
     def toggle_visible(self):
